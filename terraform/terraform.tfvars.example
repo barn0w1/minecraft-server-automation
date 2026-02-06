@@ -1,0 +1,5 @@
+# Example values. Copy to terraform.tfvars and fill in.
+
+cloudflare_api_token = ""
+cloudflare_zone_id   = ""
+dns_record_name      = "mc.example.com"

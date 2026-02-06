@@ -1,0 +1,22 @@
+services:
+  minecraft:
+    image: itzg/minecraft-server
+    ports:
+      - "25565:25565"
+    volumes:
+      - "./data:/data"
+    environment:
+      EULA: "TRUE"
+      TYPE: "PAPER"
+      VERSION: "1.21.10"
+      INIT_MEMORY: "6144M"
+      MAX_MEMORY: "6144M"
+      MAX_PLAYERS: "20"
+      MOTD: "§aPlayground Network §7| §fSurvival SMP"
+      OPS: "quadro7521"
+      ICON: "https://content.webtarget.dev/minecraft/server-icon.png"
+
+      ENABLE_ROLLING_LOGS: "TRUE"
+      STOP_SERVER_ANNOUNCE_DELAY: "10"
+
+    restart: "no"
