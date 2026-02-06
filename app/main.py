@@ -2,11 +2,20 @@ import os
 import json
 import aiohttp
 import asyncio
+import logging
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 from mcstatus import JavaServer
 
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -65,6 +74,8 @@ async def _call_mc_control(action: str, world: str):
 
     body = {'action': action, 'world': world}
 
+    logger.info(f"Calling Lambda API: action={action}, world={world}")
+
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, data=json.dumps(body)) as resp:
             text = await resp.text()
@@ -76,8 +87,10 @@ async def _call_mc_control(action: str, world: str):
             if resp.status >= 400:
                 msg = data.get('error') if isinstance(data, dict) else None
                 msg = msg or (data.get('raw') if isinstance(data, dict) else None) or text[:200]
+                logger.error(f"Lambda API error: HTTP {resp.status}, {msg}")
                 raise RuntimeError(f"mc-control HTTP {resp.status}: {msg}")
 
+            logger.info(f"Lambda API response: status={resp.status}, data={data}")
             return data
 
 
@@ -141,6 +154,117 @@ def format_estimated_time(status: str) -> str:
     return eta_map.get(status.upper(), '')
 
 
+async def check_minecraft_server(ip: str, port: int = 25565, max_retries: int = 3) -> bool:
+    """Check if Minecraft server is accessible using Minecraft Ping protocol."""
+    logger.info(f"Checking Minecraft server at {ip}:{port}")
+
+    for attempt in range(max_retries):
+        try:
+            server = JavaServer.lookup(f"{ip}:{port}")
+            status = await server.async_status()
+            # If we get here, server responded successfully
+            logger.info(f"Minecraft server is accessible at {ip}:{port}")
+            return True
+        except Exception as e:
+            logger.warning(f"Minecraft ping attempt {attempt + 1}/{max_retries} failed: {e}")
+            # Log the attempt but continue retrying
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)  # Wait 2 seconds before retry
+            continue
+
+    logger.error(f"Minecraft server at {ip}:{port} is not accessible after {max_retries} attempts")
+    return False
+
+
+async def wait_for_server_running(world: str, max_wait: int = 600) -> dict:
+    """
+    Wait for server to be fully running and accessible.
+
+    Polls Lambda API to check status, then verifies Minecraft server is accessible.
+    Returns server data dict when fully ready, or raises TimeoutError.
+    """
+    logger.info(f"Waiting for server '{world}' to be running (max {max_wait}s)")
+    start_time = asyncio.get_event_loop().time()
+    poll_interval = 10  # Poll every 10 seconds
+
+    ip_address = None
+    minecraft_check_started = False
+
+    while True:
+        elapsed = asyncio.get_event_loop().time() - start_time
+
+        if elapsed > max_wait:
+            logger.error(f"Server '{world}' startup timed out after {max_wait}s")
+            raise TimeoutError(f"サーバー起動がタイムアウトしました（{max_wait}秒）")
+
+        try:
+            # Check Lambda API status
+            data = await _call_mc_control('status', world)
+            status = (data.get('status') or '').upper()
+
+            if status == 'RUNNING':
+                ip_address = data.get('ip_address') or data.get('ip')
+
+                if ip_address:
+                    # Start Minecraft connectivity check
+                    if not minecraft_check_started:
+                        minecraft_check_started = True
+                        logger.info(f"Server '{world}' is RUNNING, checking Minecraft connectivity...")
+
+                    # Check if Minecraft server is actually accessible
+                    if await check_minecraft_server(ip_address):
+                        # Success! Server is fully ready
+                        logger.info(f"Server '{world}' is fully running and accessible at {ip_address}")
+                        return data
+
+            # Not ready yet, continue polling
+            logger.debug(f"Server '{world}' status: {status}, elapsed: {elapsed:.1f}s")
+            await asyncio.sleep(poll_interval)
+
+        except Exception as e:
+            # Continue polling even if there's an error
+            logger.warning(f"Error while polling server '{world}': {e}")
+            await asyncio.sleep(poll_interval)
+
+
+async def wait_for_server_stopped(world: str, max_wait: int = 600) -> dict:
+    """
+    Wait for server to be fully stopped.
+
+    Polls Lambda API to check status.
+    Returns server data dict when stopped, or raises TimeoutError.
+    """
+    logger.info(f"Waiting for server '{world}' to be stopped (max {max_wait}s)")
+    start_time = asyncio.get_event_loop().time()
+    poll_interval = 10  # Poll every 10 seconds
+
+    while True:
+        elapsed = asyncio.get_event_loop().time() - start_time
+
+        if elapsed > max_wait:
+            logger.error(f"Server '{world}' stop timed out after {max_wait}s")
+            raise TimeoutError(f"サーバー停止がタイムアウトしました（{max_wait}秒）")
+
+        try:
+            # Check Lambda API status
+            data = await _call_mc_control('status', world)
+            status = (data.get('status') or '').upper()
+
+            if status == 'STOPPED':
+                # Success! Server is fully stopped
+                logger.info(f"Server '{world}' is stopped")
+                return data
+
+            # Not stopped yet, continue polling
+            logger.debug(f"Server '{world}' status: {status}, elapsed: {elapsed:.1f}s")
+            await asyncio.sleep(poll_interval)
+
+        except Exception as e:
+            # Continue polling even if there's an error
+            logger.warning(f"Error while polling server '{world}': {e}")
+            await asyncio.sleep(poll_interval)
+
+
 class MinecraftBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -163,6 +287,7 @@ client = MinecraftBot()
 
 @client.event
 async def on_ready():
+    logger.info(f'Bot logged in as {client.user} (ID: {client.user.id})')
     print(f'Logged in as {client.user} (ID: {client.user.id})')
 
 
@@ -172,7 +297,12 @@ mc = app_commands.Group(name='mc', description='Control the Minecraft worlds (mc
 @mc.command(name='status', description='Check world status')
 @app_commands.describe(world='World name (default: DEFAULT_WORLD)')
 async def mc_status(interaction: discord.Interaction, world: str | None = None):
+    world = (world or DEFAULT_WORLD or '').strip()
+    user = f"{interaction.user.name}#{interaction.user.discriminator}"
+    logger.info(f"Command /mc status executed by {user} for world '{world}'")
+
     if not _is_allowed(interaction):
+        logger.warning(f"User {user} denied access to /mc status")
         embed = create_error_embed(
             'Permission Denied',
             ERROR_MESSAGES['permission_denied'],
@@ -181,7 +311,6 @@ async def mc_status(interaction: discord.Interaction, world: str | None = None):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    world = (world or DEFAULT_WORLD or '').strip()
     await interaction.response.defer(ephemeral=EPHEMERAL_DEFAULT)
 
     try:
@@ -234,9 +363,11 @@ async def mc_status(interaction: discord.Interaction, world: str | None = None):
             embed.set_footer(text=HELP_TEXT['snapshot_complete_hint'])
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(f"Status response sent to {user} for world '{world}': {status}")
 
     except Exception as e:
         error_msg = str(e)
+        logger.error(f"Error in /mc status for world '{world}': {error_msg}")
         embed = create_error_embed(
             'Server Error',
             ERROR_MESSAGES['server_error'],
@@ -248,7 +379,12 @@ async def mc_status(interaction: discord.Interaction, world: str | None = None):
 @mc.command(name='start', description='Start a world (creates an EC2 instance)')
 @app_commands.describe(world='World name (default: DEFAULT_WORLD)')
 async def mc_start(interaction: discord.Interaction, world: str | None = None):
+    world = (world or DEFAULT_WORLD or '').strip()
+    user = f"{interaction.user.name}#{interaction.user.discriminator}"
+    logger.info(f"Command /mc start executed by {user} for world '{world}'")
+
     if not _is_allowed(interaction):
+        logger.warning(f"User {user} denied access to /mc start")
         embed = create_error_embed(
             'Permission Denied',
             ERROR_MESSAGES['permission_denied'],
@@ -257,68 +393,54 @@ async def mc_start(interaction: discord.Interaction, world: str | None = None):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    world = (world or DEFAULT_WORLD or '').strip()
-    await interaction.response.defer(ephemeral=True)
+    # Send immediate acknowledgment (private)
+    await interaction.response.send_message(
+        f"リクエストを受け付けました。サーバーを起動中...\n最大10分程度かかる場合があります。",
+        ephemeral=True
+    )
 
     try:
-        data = await _call_mc_control('start', world)
-        status = (data.get('status') or 'UNKNOWN').upper()
-        instance_id = data.get('instance_id')
+        # Request server start from Lambda
+        await _call_mc_control('start', world)
 
-        # Check if server was already running
-        is_already_running = status == 'RUNNING' and data.get('ip')
+        # Wait for server to be fully running and accessible
+        data = await wait_for_server_running(world, max_wait=600)
 
-        # Private response
-        embed = discord.Embed(title=f"Server Start", color=_status_color(status))
-        embed.add_field(name='World', value=world, inline=True)
-        embed.add_field(name='Status', value=status, inline=True)
+        # Server is ready! Send public notification
+        ip_v4 = data.get('ip_address')
+        ip_v6 = data.get('ipv6_address')
 
-        if is_already_running:
-            # Already running - show connection info
-            ip_v4 = data.get('ip') or data.get('ip_address')
-            ip_v6 = data.get('ipv6') or data.get('ipv6_address')
+        embed = discord.Embed(
+            title="Minecraft Server Ready",
+            description=f"**{world}** が起動しました。接続できます！",
+            color=0x2ecc71  # Green
+        )
 
-            if ip_v4:
-                embed.add_field(name='IPv4 Address', value=f"`{ip_v4}`", inline=False)
-            if ip_v6:
-                embed.add_field(name='IPv6 Address', value=f"`{ip_v6}`", inline=False)
+        if ip_v4:
+            embed.add_field(name='IPv4 Address', value=f"`{ip_v4}`", inline=False)
+        if ip_v6:
+            embed.add_field(name='IPv6 Address', value=f"`{ip_v6}`", inline=False)
 
-            embed.add_field(name='Connection', value=HELP_TEXT['connection_ready'], inline=False)
+        await interaction.channel.send(embed=embed)
 
-            if instance_id:
-                embed.set_footer(text=f"Instance ID: {instance_id}")
+        # Also update the private message
+        await interaction.followup.send("サーバーが起動しました！", ephemeral=True)
+        logger.info(f"Server '{world}' successfully started by {user} at {ip_v4}")
 
-        else:
-            # Starting now
-            if instance_id:
-                embed.add_field(name='Instance', value=f"`{instance_id}`", inline=False)
-
-            eta = format_estimated_time('STARTING')
-            if eta:
-                embed.add_field(name='Estimated Time', value=eta, inline=False)
-
-            embed.add_field(name='Next Step', value='/mc status で進行状況を確認できます', inline=False)
-            embed.set_footer(text='サーバーが起動したら接続情報が表示されます')
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-        # Public announcement only if starting (not if already running)
-        if not is_already_running:
-            public_embed = discord.Embed(
-                title=f"Minecraft Server Starting",
-                description=f"{interaction.user.mention} がサーバーを起動しました",
-                color=_status_color(status)
-            )
-            public_embed.add_field(name='World', value=world, inline=True)
-            public_embed.add_field(name='Status', value=status, inline=True)
-            eta = format_estimated_time('STARTING')
-            if eta:
-                public_embed.add_field(name='ETA', value=eta, inline=False)
-
-            await interaction.channel.send(embed=public_embed)
+    except TimeoutError as e:
+        # Timeout - server didn't start in time
+        logger.error(f"Server '{world}' start timed out for user {user}: {e}")
+        error_embed = create_error_embed(
+            'Timeout',
+            'サーバー起動がタイムアウトしました',
+            f"{str(e)}\n\n/mc status で現在の状態を確認してください。"
+        )
+        await interaction.followup.send(embed=error_embed, ephemeral=True)
 
     except Exception as e:
+        # Other errors
         error_msg = str(e)
+        logger.error(f"Error in /mc start for world '{world}' by {user}: {error_msg}")
         embed = create_error_embed(
             'Server Error',
             ERROR_MESSAGES['server_error'],
@@ -330,7 +452,12 @@ async def mc_start(interaction: discord.Interaction, world: str | None = None):
 @mc.command(name='stop', description='Stop a world (snapshot + terminate EC2)')
 @app_commands.describe(world='World name (default: DEFAULT_WORLD)')
 async def mc_stop(interaction: discord.Interaction, world: str | None = None):
+    world = (world or DEFAULT_WORLD or '').strip()
+    user = f"{interaction.user.name}#{interaction.user.discriminator}"
+    logger.info(f"Command /mc stop executed by {user} for world '{world}'")
+
     if not _is_allowed(interaction):
+        logger.warning(f"User {user} denied access to /mc stop")
         embed = create_error_embed(
             'Permission Denied',
             ERROR_MESSAGES['permission_denied'],
@@ -339,46 +466,48 @@ async def mc_stop(interaction: discord.Interaction, world: str | None = None):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    world = (world or DEFAULT_WORLD or '').strip()
-    await interaction.response.defer(ephemeral=True)
+    # Send immediate acknowledgment (private)
+    await interaction.response.send_message(
+        f"リクエストを受け付けました。サーバーを停止中...\n最大10分程度かかる場合があります。",
+        ephemeral=True
+    )
 
     try:
-        data = await _call_mc_control('stop', world)
-        status = (data.get('status') or 'UNKNOWN').upper()
+        # Request server stop from Lambda
+        await _call_mc_control('stop', world)
 
-        # Private response
-        embed = discord.Embed(title=f"Server Stop", color=_status_color(status))
-        embed.add_field(name='World', value=world, inline=True)
-        embed.add_field(name='Status', value=status, inline=True)
+        # Wait for server to be fully stopped
+        data = await wait_for_server_stopped(world, max_wait=600)
 
-        # Add process flow
-        process_flow = """1. Minecraftサーバーを安全に停止
-2. ワールドデータをスナップショット
-3. スナップショットをS3にアップロード
-4. EC2インスタンスを終了"""
-        embed.add_field(name='Process', value=process_flow, inline=False)
-
-        eta = format_estimated_time('STOPPING')
-        if eta:
-            embed.add_field(name='Estimated Time', value=eta, inline=False)
-
-        embed.set_footer(text=HELP_TEXT['auto_save_hint'])
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-        # Public announcement
-        public_embed = discord.Embed(
-            title=f"Minecraft Server Stopping",
-            description=f"{interaction.user.mention} がサーバーを停止しました",
-            color=_status_color(status)
+        # Server is stopped! Send public notification
+        embed = discord.Embed(
+            title="Minecraft Server Stopped",
+            description=f"**{world}** が停止しました。",
+            color=0x95a5a6  # Gray
         )
-        public_embed.add_field(name='World', value=world, inline=True)
-        public_embed.add_field(name='Status', value=status, inline=True)
-        public_embed.add_field(name='Note', value=HELP_TEXT['world_data_saved'], inline=False)
-        public_embed.set_footer(text='停止完了まで約1-2分かかります')
-        await interaction.channel.send(embed=public_embed)
+        embed.add_field(name='Status', value='STOPPED', inline=False)
+        embed.set_footer(text='ワールドデータは自動的にS3に保存されています')
+
+        await interaction.channel.send(embed=embed)
+
+        # Also update the private message
+        await interaction.followup.send("サーバーが停止しました。", ephemeral=True)
+        logger.info(f"Server '{world}' successfully stopped by {user}")
+
+    except TimeoutError as e:
+        # Timeout - server didn't stop in time
+        logger.error(f"Server '{world}' stop timed out for user {user}: {e}")
+        error_embed = create_error_embed(
+            'Timeout',
+            'サーバー停止がタイムアウトしました',
+            f"{str(e)}\n\n/mc status で現在の状態を確認してください。"
+        )
+        await interaction.followup.send(embed=error_embed, ephemeral=True)
 
     except Exception as e:
+        # Other errors
         error_msg = str(e)
+        logger.error(f"Error in /mc stop for world '{world}' by {user}: {error_msg}")
         embed = create_error_embed(
             'Server Error',
             ERROR_MESSAGES['server_error'],
@@ -387,78 +516,7 @@ async def mc_stop(interaction: discord.Interaction, world: str | None = None):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@mc.command(name='snapshot', description='Create a snapshot (does not terminate EC2)')
-@app_commands.describe(world='World name (default: DEFAULT_WORLD)')
-async def mc_snapshot(interaction: discord.Interaction, world: str | None = None):
-    if not _is_allowed(interaction):
-        embed = create_error_embed(
-            'Permission Denied',
-            ERROR_MESSAGES['permission_denied'],
-            ERROR_MESSAGES['permission_contact']
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    world = (world or DEFAULT_WORLD or '').strip()
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        data = await _call_mc_control('snapshot', world)
-        status = (data.get('status') or 'UNKNOWN').upper()
-
-        # Private response
-        embed = discord.Embed(title=f"Snapshot Request", color=_status_color(status))
-        embed.add_field(name='World', value=world, inline=True)
-        embed.add_field(name='Status', value=status, inline=True)
-
-        if status == 'SNAPSHOT_REQUESTED':
-            embed.add_field(name='Process', value='バックグラウンドでスナップショットを作成中', inline=False)
-            embed.add_field(name='Note', value='サーバーは稼働し続けます。プレイ可能です', inline=False)
-            embed.add_field(name='Storage', value='S3の履歴フォルダとメインフォルダの両方に保存', inline=False)
-
-            eta = format_estimated_time('SNAPSHOT_REQUESTED')
-            if eta:
-                embed.set_footer(text=f"{eta}")
-
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-            # Public announcement
-            public_embed = discord.Embed(
-                title=f"Snapshot Requested",
-                description=f"{interaction.user.mention} がスナップショットを作成しました",
-                color=_status_color(status)
-            )
-            public_embed.add_field(name='World', value=world, inline=True)
-            public_embed.add_field(name='Status', value=status, inline=True)
-            await interaction.channel.send(embed=public_embed)
-
-        else:
-            # Failed (server not running)
-            embed = create_error_embed(
-                'Snapshot Error',
-                'スナップショットを作成できません',
-                f"現在のステータス: {status}\n\n理由: サーバーが起動している必要があります\n\n解決方法: /mc start でサーバーを起動してから再試行してください"
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-    except Exception as e:
-        error_msg = str(e)
-        # Check if it's a "not running" error
-        if 'not running' in error_msg.lower() or 'not RUNNING' in error_msg:
-            embed = create_error_embed(
-                'Snapshot Error',
-                'スナップショットを作成できません',
-                "理由: サーバーが起動していません\n\n解決方法: /mc start でサーバーを起動してから再試行してください"
-            )
-        else:
-            embed = create_error_embed(
-                'Server Error',
-                ERROR_MESSAGES['server_error'],
-                f"{error_msg[:300]}\n\n{ERROR_MESSAGES['retry_later']}"
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
 client.tree.add_command(mc)
 
+logger.info("Starting Discord bot...")
 client.run(DISCORD_TOKEN)
