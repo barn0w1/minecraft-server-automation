@@ -467,10 +467,12 @@ async def mc_stop(interaction: discord.Interaction, world: str | None = None):
         return
 
     # Send immediate acknowledgment (private)
-    await interaction.response.send_message(
-        f"リクエストを受け付けました。サーバーを停止中...\n最大10分程度かかる場合があります。",
-        ephemeral=True
+    ack_embed = discord.Embed(
+        title=f"{world}",
+        description='サーバーを停止中...\n完了まで最大10分程度かかります',
+        color=0xf1c40f  # Yellow
     )
+    await interaction.response.send_message(embed=ack_embed, ephemeral=True)
 
     try:
         # Request server stop from Lambda
@@ -481,17 +483,12 @@ async def mc_stop(interaction: discord.Interaction, world: str | None = None):
 
         # Server is stopped! Send public notification
         embed = discord.Embed(
-            title="Minecraft Server Stopped",
-            description=f"**{world}** が停止しました。",
+            title=f"{world}",
+            description='停止完了',
             color=0x95a5a6  # Gray
         )
-        embed.add_field(name='Status', value='STOPPED', inline=False)
-        embed.set_footer(text='ワールドデータは自動的にS3に保存されています')
 
         await interaction.channel.send(embed=embed)
-
-        # Also update the private message
-        await interaction.followup.send("サーバーが停止しました。", ephemeral=True)
         logger.info(f"Server '{world}' successfully stopped by {user}")
 
     except TimeoutError as e:
